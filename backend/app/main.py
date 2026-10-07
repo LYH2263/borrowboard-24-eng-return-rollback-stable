@@ -1,9 +1,10 @@
 from datetime import date, datetime, timezone
+import sqlite3
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from app import seed
-from app.db import connect
+from app.db import connect, immediate_tx
 from app.engines.borrow_rules import can_lend, classify_loans
 
 app = FastAPI(title="Borrowboard", version="0.1.0")
@@ -53,29 +54,50 @@ class LendIn(BaseModel):
 @app.post("/api/items/{iid}/lend")
 def lend(iid: int, body: LendIn):
     c = connect()
-    item = c.execute("SELECT * FROM items WHERE id=?", (iid,)).fetchone()
-    if not item: c.close(); raise HTTPException(404, "item")
-    active = c.execute("SELECT COUNT(*) c FROM loans WHERE item_id=? AND status='active'", (iid,)).fetchone()["c"]
-    check = can_lend(item["status"], active)
-    if not check["ok"]:
-        c.close(); raise HTTPException(409, check["reason"])
-    cur = c.execute(
-        "INSERT INTO loans(item_id,borrower,status,due_date,lent_at) VALUES (?,?,?,?,?)",
-        (iid, body.borrower, "active", body.due_date, datetime.now(timezone.utc).isoformat()))
-    c.execute("UPDATE items SET status='on_loan' WHERE id=?", (iid,))
-    c.commit(); lid = cur.lastrowid; c.close(); return {"loan_id": lid}
+    try:
+        try:
+            with immediate_tx(c):
+                item = c.execute("SELECT * FROM items WHERE id=?", (iid,)).fetchone()
+                if not item:
+                    raise HTTPException(404, "item")
+                active = c.execute(
+                    "SELECT COUNT(*) c FROM loans WHERE item_id=? AND status='active'",
+                    (iid,)).fetchone()["c"]
+                check = can_lend(item["status"], active)
+                if not check["ok"]:
+                    raise HTTPException(409, check["reason"])
+                cur = c.execute(
+                    "INSERT INTO loans(item_id,borrower,status,due_date,lent_at) VALUES (?,?,?,?,?)",
+                    (iid, body.borrower, "active", body.due_date,
+                     datetime.now(timezone.utc).isoformat()))
+                c.execute("UPDATE items SET status='on_loan' WHERE id=?", (iid,))
+                lid = cur.lastrowid
+        except sqlite3.OperationalError:
+            # 与补偿事务争锁时不做脏写，排队/重试即可。
+            raise HTTPException(503, "busy")
+    finally:
+        c.close()
+    return {"loan_id": lid}
 
 @app.post("/api/loans/{lid}/return")
 def return_loan(lid: int):
     c = connect()
-    loan = c.execute("SELECT * FROM loans WHERE id=?", (lid,)).fetchone()
-    if not loan: c.close(); raise HTTPException(404, "loan")
-    if loan["status"] != "active":
-        c.close(); raise HTTPException(400, "not_active")
-    c.execute("UPDATE loans SET status='returned', returned_at=? WHERE id=?",
-              (datetime.now(timezone.utc).isoformat(), lid))
-    c.execute("UPDATE items SET status='available' WHERE id=?", (loan["item_id"],))
-    c.commit(); c.close(); return {"ok": True}
+    try:
+        try:
+            with immediate_tx(c):
+                loan = c.execute("SELECT * FROM loans WHERE id=?", (lid,)).fetchone()
+                if not loan:
+                    raise HTTPException(404, "loan")
+                if loan["status"] != "active":
+                    raise HTTPException(400, "not_active")
+                c.execute("UPDATE loans SET status='returned', returned_at=? WHERE id=?",
+                          (datetime.now(timezone.utc).isoformat(), lid))
+                c.execute("UPDATE items SET status='available' WHERE id=?", (loan["item_id"],))
+        except sqlite3.OperationalError:
+            raise HTTPException(503, "busy")
+    finally:
+        c.close()
+    return {"ok": True}
 
 @app.get("/api/loans")
 def loans():
