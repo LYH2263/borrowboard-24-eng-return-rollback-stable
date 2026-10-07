@@ -7,6 +7,7 @@ def db_path() -> Path:
     return d / "borrowboard.db"
 
 def connect():
-    c = sqlite3.connect(db_path())
+    c = sqlite3.connect(db_path(), timeout=10)
     c.row_factory = sqlite3.Row
+    c.execute("PRAGMA busy_timeout=10000")
     return c
